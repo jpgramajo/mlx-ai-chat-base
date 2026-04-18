@@ -36,13 +36,46 @@ _THINKING_RE   = re.compile(r"<think>.*?</think>", re.DOTALL)
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def parse_tool_calls(text: str) -> list[dict]:
-    """Extrae todas las tool calls del texto generado por el modelo."""
+    """
+    Extrae tool calls del texto generado por Qwen3.5.
+    Soporta dos formatos:
+
+    Formato JSON (esperado):
+        <tool_call>{"name": "get_time", "arguments": {}}</tool_call>
+
+    Formato XML (real de Qwen3.5):
+        <tool_call>
+        <function=get_time>
+        {"location": "Guatemala"}
+        </function>
+        </tool_call>
+    """
     calls = []
     for match in _TOOL_CALL_RE.finditer(text):
+        inner = match.group(1).strip()
+
+        # Formato JSON
         try:
-            calls.append(json.loads(match.group(1)))
+            calls.append(json.loads(inner))
+            continue
         except json.JSONDecodeError:
             pass
+
+        # Formato XML: <function=name> [args_json?] </function>
+        xml_match = re.match(
+            r"<function=(\w+)>\s*(.*?)\s*</function>",
+            inner,
+            re.DOTALL,
+        )
+        if xml_match:
+            name = xml_match.group(1)
+            args_raw = xml_match.group(2).strip()
+            try:
+                arguments = json.loads(args_raw) if args_raw else {}
+            except json.JSONDecodeError:
+                arguments = {}
+            calls.append({"name": name, "arguments": arguments})
+
     return calls
 
 
@@ -62,26 +95,12 @@ def print_separator(char: str = "─", width: int = 60) -> None:
     print(char * width)
 
 
-def generate_streaming(
-    model,
-    tokenizer,
-    prompt: str,
-    max_tokens: int,
-    *,
-    silent: bool = False,
-) -> str:
+def generate_streaming(model, tokenizer, prompt: str, max_tokens: int) -> str:
     """
-    Genera tokens con streaming.
-
-    - silent=False  → imprime token a token (respuesta final visible).
-    - silent=True   → acumula sin imprimir (pasadas intermedias de tool calling).
-
-    Retorna el texto completo generado.
+    Genera tokens con streaming, imprime chunk a chunk y retorna el texto completo.
+    El caller es responsable de imprimir el header antes de llamar.
     """
     full_text = ""
-
-    if not silent:
-        print("\nAsistente: ", end="", flush=True)
 
     for response in stream_generate(
         model,
@@ -91,12 +110,9 @@ def generate_streaming(
     ):
         chunk: str = response.text
         full_text += chunk
-        if not silent:
-            print(chunk, end="", flush=True)
+        print(chunk, end="", flush=True)
 
-    if not silent:
-        print()  # salto de línea al terminar stream
-
+    print()  # salto de línea al terminar stream
     return full_text
 
 
@@ -126,12 +142,14 @@ def chat_loop(model, tokenizer) -> None:
 
         messages.append({"role": "user", "content": user_input})
 
-        # ── Primera pasada ────────────────────────────────────────────────
-        # Si tools están activas, la ocultamos: puede contener XML de tool call.
-        # Si no hay tools, esta ya es la respuesta final → la mostramos.
+        # ── Primera pasada — siempre en streaming ────────────────────────
+        # Streameamos desde el primer token. Si el modelo emite tool calls,
+        # el XML aparecerá en pantalla brevemente; lo limpiamos con el print
+        # posterior. En la gran mayoría de turnos no hay tools y el usuario
+        # ve la respuesta en tiempo real.
         prompt = build_prompt(messages, tokenizer, active_tools)
-        is_first_pass_silent = USE_TOOLS  # ocultamos si puede haber tool calls
-        raw = generate_streaming(model, tokenizer, prompt, MAX_TOKENS, silent=is_first_pass_silent)
+        print("\nAsistente: ", end="", flush=True)
+        raw = generate_streaming(model, tokenizer, prompt, MAX_TOKENS)
 
         # ── Ciclo de tool calling ─────────────────────────────────────────
         tool_calls = parse_tool_calls(raw) if USE_TOOLS else []
@@ -153,17 +171,11 @@ def chat_loop(model, tokenizer) -> None:
                     "content": result,
                 })
 
-            # Segunda pasada: síntesis con resultados → siempre visible
+            # Síntesis con resultados → también en streaming
+            print("\nAsistente: ", end="", flush=True)
             prompt = build_prompt(messages, tokenizer, active_tools)
-            raw = generate_streaming(model, tokenizer, prompt, MAX_TOKENS, silent=False)
+            raw = generate_streaming(model, tokenizer, prompt, MAX_TOKENS)
             tool_calls = parse_tool_calls(raw)
-
-        # ── Si no hubo tools, mostrar la respuesta acumulada ──────────────
-        # (La primera pasada fue silent=True pero no hubo tool calls,
-        # así que raw tiene la respuesta final sin haberla imprimido.)
-        if USE_TOOLS and not tool_calls:
-            visible = strip_thinking(raw)
-            print(f"\nAsistente: {visible}")
 
         # Guardar en historial el texto completo (con <think> si lo hay)
         messages.append({"role": "assistant", "content": raw})
